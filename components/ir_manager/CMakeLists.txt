@@ -8,5 +8,5 @@ idf_component_register(
             driver 
             fatfs 
             sdmmc
-            "ir_receiver" "ir_transmitter" "ir_protocol" "ir_file" "ir_encoder" "ir_path"
+            "ir_receiver" "ir_transmitter" "ir_protocol" "ir_file" "ir_encoder" "ir_path" "ir_processor"
 )

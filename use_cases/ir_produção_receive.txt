@@ -48,3 +48,11 @@ void app_main(void)
     rmt_rx_delete();
     ESP_LOGI(TAG, "Receptor IR finalizado.");
 }
+
+///
+
+void app_main(void)
+{
+    static rmt_symbol_word_t raw_symbols[MEM_BLOCK_SYMBOLS];
+    ir_receive_file("arquivo.bin", raw_symbols);
+}
