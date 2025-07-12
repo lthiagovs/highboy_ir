@@ -1,0 +1,43 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "ir_receiver.h"
+
+#define TAG "MAIN"
+
+static rmt_symbol_word_t raw_symbols[MEM_BLOCK_SYMBOLS];
+
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Inicializando receptor IR...");
+
+    if (!rmt_rx_init()) {
+        ESP_LOGE(TAG, "Erro na inicialização do receptor IR");
+        return;
+    }
+
+    if (!rmt_rx_receive_start_queue()) {
+        ESP_LOGE(TAG, "Falha ao criar fila de recepção");
+        return;
+    }
+
+    size_t received = 0;
+
+    if (rmt_rx_receive_once(raw_symbols, MEM_BLOCK_SYMBOLS, &received)) {
+        ESP_LOGI(TAG, "Recebido %d símbolos IR", (int)received);
+        for (size_t i = 0; i < received && i < 10; i++) {
+            ESP_LOGI(TAG, "Simb[%d] L0=%d D0=%dus L1=%d D1=%dus", (int)i,
+                     raw_symbols[i].level0, raw_symbols[i].duration0,
+                     raw_symbols[i].level1, raw_symbols[i].duration1);
+        }
+    } else {
+        ESP_LOGW(TAG, "Timeout - nenhum sinal recebido");
+    }
+
+    rmt_rx_receive_stop_queue();  // Limpa a fila
+    rmt_rx_delete();              // Deleta canal RX
+
+    ESP_LOGI(TAG, "Receptor IR finalizado.");
+}

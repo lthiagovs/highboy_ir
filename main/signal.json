@@ -1,0 +1,4 @@
+{
+  "samsung": ["power", "volume_up"],
+  "lg": ["power", "volume_down"]
+}

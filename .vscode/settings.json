@@ -1,0 +1,39 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "C:\\Users\\Thiago\\esp\\v5.4.1\\esp-idf",
+  "idf.pythonInstallPath": "C:\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-bridge.cfg"
+  ],
+  "idf.portWin": "COM7",
+  "idf.toolsPathWin": "C:\\Espressif",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-18.1.2_20240912\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=C:\\Espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
+    "--compile-commands-dir=c:\\Users\\Thiago\\Documents\\hb_ir\\hb_ir\\build"
+  ],
+  "files.associations": {
+    "stdlib.h": "c",
+    "spi_master.h": "c",
+    "stdint.h": "c",
+    "rmt_rx.h": "c",
+    "esp_log.h": "c",
+    "esp_err.h": "c",
+    "inttypes.h": "c",
+    "task.h": "c",
+    "ringbuf.h": "c",
+    "ir_transmitter.h": "c",
+    "freertos.h": "c",
+    "gpio.h": "c",
+    "rmt_tx.h": "c",
+    "queue.h": "c",
+    "esp_system.h": "c",
+    "ir_path.h": "c",
+    "ir_receiver.h": "c"
+  },
+  "idf.flashType": "UART"
+}

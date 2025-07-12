@@ -1,0 +1,45 @@
+#include "ir_path.h"
+
+void app_main() {
+    // Inicializa o módulo
+    if (ir_path_init() != IR_PATH_OK) {
+        ESP_LOGE("MAIN", "Failed to initialize SD card");
+        return;
+    }
+    
+    // Escreve um arquivo
+    ir_path_write_file("teste.txt", "Conteúdo do arquivo", false);
+    
+    // Lê o arquivo
+    char buffer[256];
+    ir_path_read_file("teste.txt", buffer, sizeof(buffer));
+    
+    // Lista arquivos
+    file_list_t list;
+    ir_path_list_files(&list);
+    
+    for (int i = 0; i < list.count; i++) {
+       ESP_LOGI("MAIN", "%s - %s (%d bytes)", 
+                list.files[i].name,
+                list.files[i].is_directory ? "DIR" : "FILE",
+                list.files[i].size);
+    }
+   
+   // Cria uma pasta
+   ir_path_create_directory("subpasta");
+   
+   // Verifica se arquivo existe
+   if (ir_path_file_exists("teste.txt")) {
+       ESP_LOGI("MAIN", "Arquivo existe!");
+   }
+   
+   // Obtém informações de armazenamento
+   uint64_t total, used;
+   if (ir_path_get_storage_info(&total, &used) == IR_PATH_OK) {
+       ESP_LOGI("MAIN", "SD Card: %llu MB total, %llu MB usado", 
+                total/1024/1024, used/1024/1024);
+   }
+   
+   // Cleanup ao final
+   ir_path_deinit();
+}

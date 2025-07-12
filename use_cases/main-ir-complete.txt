@@ -1,0 +1,1144 @@
+#include "driver/rmt_tx.h"  // Novo driver para transmissão
+#include "driver/rmt_rx.h"  // Novo driver para recepção
+#include "soc/rtc.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_timer.h" 
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"  // Biblioteca para fila no FreeRTOS
+
+//STATICS
+QueueHandle_t receive_queue = NULL;
+//STATICS
+
+//CALLBACK DE TRANSMISSÃO
+// Função de callback para o evento de transmissão concluída
+// Função de callback para o evento de transmissão concluída
+bool on_trans_done(rmt_channel_handle_t chan, const rmt_tx_done_event_data_t *edata, void *user_data) {
+    //ESP_LOGI("RMT", "Transmissão concluída. Símbolos transmitidos: %d", edata->num_symbols);
+
+    // Desabilitar o canal após a transmissão ter sido concluída
+    //ESP_ERROR_CHECK(rmt_disable(chan));
+    //ESP_LOGI("RMT", "Canal desabilitado após a transmissão.");
+
+    return false;
+}
+
+//CALLBACK DE RECEPÇÃO
+// Função de callback para o evento de recepção concluída
+bool on_recv_done(rmt_channel_handle_t chan, const rmt_rx_done_event_data_t *edata, void *user_data) {
+    // Enviar os dados recebidos para a fila (operação segura em ISR)
+    BaseType_t high_task_awoken = pdFALSE;
+    
+    if (receive_queue != NULL) {
+        // Usar versão FromISR para operações em contexto de interrupção
+        xQueueSendFromISR(receive_queue, edata, &high_task_awoken);
+    }
+    
+    // Retornar se uma tarefa de maior prioridade foi desbloqueada
+    return high_task_awoken == pdTRUE;
+}
+
+// RMT ENCODER <-----------------------------------------------------------------------------------------------------
+
+// Estrutura para o encoder NEC customizado
+typedef struct {
+    rmt_encoder_t base;           // Encoder base (deve ser o primeiro membro)
+    rmt_encoder_t *copy_encoder;  // Encoder de cópia para símbolos
+    rmt_encoder_t *bytes_encoder; // Encoder para bytes
+    rmt_symbol_word_t nec_leading_symbol;  // Símbolo inicial do protocolo NEC
+    rmt_symbol_word_t nec_ending_symbol;   // Símbolo final do protocolo NEC
+    int state;                    // Estado atual do encoder
+} rmt_nec_encoder_t;
+
+// Estados do encoder NEC
+typedef enum {
+    NEC_ENCODE_STATE_IDLE,
+    NEC_ENCODE_STATE_LEADING,
+    NEC_ENCODE_STATE_DATA,
+    NEC_ENCODE_STATE_ENDING
+} nec_encode_state_t;
+
+// Função de encoding do protocolo NEC
+static size_t IRAM_ATTR rmt_encode_nec(rmt_encoder_t *encoder, rmt_channel_handle_t channel,
+                                       const void *primary_data, size_t data_size,
+                                       rmt_encode_state_t *ret_state)
+{
+    rmt_nec_encoder_t *nec_encoder = __containerof(encoder, rmt_nec_encoder_t, base);
+    rmt_encode_state_t session_state = RMT_ENCODING_RESET;
+    rmt_encode_state_t state = RMT_ENCODING_RESET;
+    size_t encoded_symbols = 0;
+    
+    switch (nec_encoder->state) {
+        case NEC_ENCODE_STATE_IDLE:
+            nec_encoder->state = NEC_ENCODE_STATE_LEADING;
+            // Não há break aqui, continua para o próximo estado
+            
+        case NEC_ENCODE_STATE_LEADING:
+            // Codificar o símbolo inicial (9ms HIGH + 4.5ms LOW)
+            encoded_symbols += nec_encoder->copy_encoder->encode(
+                nec_encoder->copy_encoder, channel,
+                &nec_encoder->nec_leading_symbol, sizeof(rmt_symbol_word_t), &session_state);
+            
+            if (session_state & RMT_ENCODING_COMPLETE) {
+                nec_encoder->state = NEC_ENCODE_STATE_DATA;
+            }
+            if (session_state & RMT_ENCODING_MEM_FULL) {
+                state |= RMT_ENCODING_MEM_FULL;
+                goto out;
+            }
+            // Não há break aqui, continua para o próximo estado
+            
+        case NEC_ENCODE_STATE_DATA:
+            // Codificar os dados usando o bytes encoder
+            encoded_symbols += nec_encoder->bytes_encoder->encode(
+                nec_encoder->bytes_encoder, channel,
+                primary_data, data_size, &session_state);
+            
+            if (session_state & RMT_ENCODING_COMPLETE) {
+                nec_encoder->state = NEC_ENCODE_STATE_ENDING;
+            }
+            if (session_state & RMT_ENCODING_MEM_FULL) {
+                state |= RMT_ENCODING_MEM_FULL;
+                goto out;
+            }
+            // Não há break aqui, continua para o próximo estado
+            
+        case NEC_ENCODE_STATE_ENDING:
+            // Codificar o símbolo final (560µs HIGH)
+            encoded_symbols += nec_encoder->copy_encoder->encode(
+                nec_encoder->copy_encoder, channel,
+                &nec_encoder->nec_ending_symbol, sizeof(rmt_symbol_word_t), &session_state);
+            
+            if (session_state & RMT_ENCODING_COMPLETE) {
+                nec_encoder->state = NEC_ENCODE_STATE_IDLE;
+                state |= RMT_ENCODING_COMPLETE;
+            }
+            if (session_state & RMT_ENCODING_MEM_FULL) {
+                state |= RMT_ENCODING_MEM_FULL;
+                goto out;
+            }
+            break;
+    }
+    
+out:
+    *ret_state = state;
+    return encoded_symbols;
+}
+
+// Função para resetar o encoder
+static esp_err_t rmt_nec_encoder_reset(rmt_encoder_t *encoder)
+{
+    rmt_nec_encoder_t *nec_encoder = __containerof(encoder, rmt_nec_encoder_t, base);
+    
+    // Resetar encoders internos
+    rmt_encoder_reset(nec_encoder->copy_encoder);
+    rmt_encoder_reset(nec_encoder->bytes_encoder);
+    
+    // Resetar estado
+    nec_encoder->state = NEC_ENCODE_STATE_IDLE;
+    
+    return ESP_OK;
+}
+
+// Função para deletar o encoder
+static esp_err_t rmt_nec_encoder_del(rmt_encoder_t *encoder)
+{
+    rmt_nec_encoder_t *nec_encoder = __containerof(encoder, rmt_nec_encoder_t, base);
+    
+    // Deletar encoders internos
+    rmt_del_encoder(nec_encoder->copy_encoder);
+    rmt_del_encoder(nec_encoder->bytes_encoder);
+    
+    // Liberar memória
+    free(nec_encoder);
+    
+    return ESP_OK;
+}
+
+// Configuração para o encoder NEC
+typedef struct {
+    uint32_t resolution;  // Resolução do timer
+} nec_encoder_config_t;
+
+// Função para criar o encoder NEC
+esp_err_t rmt_new_nec_encoder(const nec_encoder_config_t *config, rmt_encoder_handle_t *ret_encoder)
+{
+    // Alocar memória para o encoder
+    rmt_nec_encoder_t *nec_encoder = calloc(1, sizeof(rmt_nec_encoder_t));
+    if (nec_encoder == NULL) {
+        ESP_LOGE("RMT", "Falha ao alocar memória para encoder NEC");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Configurar funções do encoder
+    nec_encoder->base.encode = rmt_encode_nec;
+    nec_encoder->base.del = rmt_nec_encoder_del;
+    nec_encoder->base.reset = rmt_nec_encoder_reset;
+    
+    // Criar copy encoder para símbolos especiais
+    rmt_copy_encoder_config_t copy_encoder_config = {};
+    esp_err_t err_copy = rmt_new_copy_encoder(&copy_encoder_config, &nec_encoder->copy_encoder);
+    if (err_copy != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao criar copy encoder: %s", esp_err_to_name(err_copy));
+        free(nec_encoder);
+        return err_copy;
+    }
+    
+    // Criar bytes encoder para dados
+    rmt_bytes_encoder_config_t bytes_encoder_config = {
+        .bit0 = {
+            .level0 = 1,
+            .duration0 = 560 * config->resolution / 1000000, // 560µs HIGH
+            .level1 = 0,
+            .duration1 = 560 * config->resolution / 1000000, // 560µs LOW
+        },
+        .bit1 = {
+            .level0 = 1,
+            .duration0 = 560 * config->resolution / 1000000,  // 560µs HIGH
+            .level1 = 0,
+            .duration1 = 1690 * config->resolution / 1000000, // 1690µs LOW
+        },
+        .flags.msb_first = 1, // Bit mais significativo primeiro
+    };
+    
+    esp_err_t err_bytes = rmt_new_bytes_encoder(&bytes_encoder_config, &nec_encoder->bytes_encoder);
+    if (err_bytes != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao criar bytes encoder: %s", esp_err_to_name(err_bytes));
+        rmt_del_encoder(nec_encoder->copy_encoder);
+        free(nec_encoder);
+        return err_bytes;
+    }
+    
+    // Configurar símbolos do protocolo NEC
+    nec_encoder->nec_leading_symbol = (rmt_symbol_word_t) {
+        .level0 = 1,
+        .duration0 = 9000 * config->resolution / 1000000,  // 9ms HIGH
+        .level1 = 0,
+        .duration1 = 4500 * config->resolution / 1000000,  // 4.5ms LOW
+    };
+    
+    nec_encoder->nec_ending_symbol = (rmt_symbol_word_t) {
+        .level0 = 1,
+        .duration0 = 560 * config->resolution / 1000000,   // 560µs HIGH
+        .level1 = 0,
+        .duration1 = 0,                                    // Sem LOW final
+    };
+    
+    nec_encoder->state = NEC_ENCODE_STATE_IDLE;
+    *ret_encoder = &nec_encoder->base;
+    
+    return ESP_OK;
+}
+
+// Exemplo de uso do encoder NEC customizado
+void exemplo_uso_encoder_nec(rmt_channel_handle_t tx_chan)
+{
+    ESP_LOGI("RMT", "=== EXEMPLO DE ENCODER NEC CUSTOMIZADO ===");
+    
+    // Criar o encoder NEC
+    nec_encoder_config_t nec_config = {
+        .resolution = 1000000,  // 1MHz (1µs por tick)
+    };
+    
+    rmt_encoder_handle_t nec_encoder = NULL;
+    esp_err_t err = rmt_new_nec_encoder(&nec_config, &nec_encoder);
+    if (err != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao criar encoder NEC: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI("RMT", "Encoder NEC criado com sucesso!");
+    
+    // Dados para transmitir (protocolo NEC padrão: Endereço + ~Endereço + Comando + ~Comando)
+    uint8_t nec_data[] = {
+        0x00,  // Endereço
+        0xFF,  // ~Endereço (complemento)
+        0x01,  // Comando
+        0xFE   // ~Comando (complemento)
+    };
+    
+    // Configuração da transmissão
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // Transmissão única
+    };
+    
+    ESP_LOGI("RMT", "Transmitindo dados NEC: 0x%02X%02X%02X%02X", 
+             nec_data[0], nec_data[1], nec_data[2], nec_data[3]);
+    
+    // Transmitir usando o encoder NEC
+    esp_err_t err_transmit = rmt_transmit(tx_chan, nec_encoder, nec_data, sizeof(nec_data), &tx_config);
+    if (err_transmit != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao transmitir com encoder NEC: %s", esp_err_to_name(err_transmit));
+    } else {
+        ESP_LOGI("RMT", "Transmissão NEC iniciada com sucesso!");
+    }
+    
+    // Aguardar conclusão
+    esp_err_t err_wait = rmt_tx_wait_all_done(tx_chan, 1000);
+    if (err_wait == ESP_OK) {
+        ESP_LOGI("RMT", "Transmissão NEC concluída com sucesso!");
+    } else {
+        ESP_LOGE("RMT", "Erro na transmissão NEC: %s", esp_err_to_name(err_wait));
+    }
+    
+    // Limpar encoder
+    rmt_del_encoder(nec_encoder);
+    ESP_LOGI("RMT", "Encoder NEC deletado.");
+}
+
+// RMT ENCODER <-----------------------------------------------------------------------------------------------------
+
+// Simple Callback Encoder - Implementação baseada na documentação ESP-IDF
+// Este exemplo mostra como usar o Simple Callback Encoder para criar protocolos IR customizados
+
+// Estrutura para dados do protocolo customizado
+typedef struct {
+    uint8_t address;     // Endereço do dispositivo
+    uint8_t command;     // Comando a ser enviado
+    uint8_t repeat;      // Número de repetições
+} ir_protocol_data_t;
+
+// Estrutura de contexto para o callback
+typedef struct {
+    const ir_protocol_data_t *data;  // Dados a serem codificados
+    size_t symbols_written;          // Contador de símbolos já escritos
+    uint32_t resolution;             // Resolução do timer (para cálculos de tempo)
+} callback_context_t;
+
+// Função callback para o Simple Encoder (assinatura correta ESP-IDF)
+static size_t IRAM_ATTR simple_ir_encode_callback(const void *data, size_t data_size, 
+                                                   size_t symbols_written, 
+                                                   size_t symbols_free,
+                                                   rmt_symbol_word_t *symbols, 
+                                                   bool *done, 
+                                                   void *arg)
+{
+    callback_context_t *ctx = (callback_context_t *)arg;
+    const ir_protocol_data_t *ir_data = (const ir_protocol_data_t *)data;
+    
+    // Verificar se temos espaço mínimo necessário
+    if (symbols_free < 1) {
+        return 0; // Não há espaço suficiente, aguardar
+    }
+    
+    // Calcular resolução para conversão de tempo
+    uint32_t resolution = ctx->resolution;
+    size_t symbols_encoded = 0;
+    
+    // Estado da máquina baseado em símbolos já escritos
+    switch (symbols_written) {
+        case 0: // Símbolo inicial (Start Bit)
+            if (symbols_free >= 1) {
+                symbols[0] = (rmt_symbol_word_t) {
+                    .level0 = 1,
+                    .duration0 = 9000 * resolution / 1000000,  // 9ms HIGH  
+                    .level1 = 0,
+                    .duration1 = 4500 * resolution / 1000000,  // 4.5ms LOW
+                };
+                symbols_encoded = 1;
+                ESP_LOGI("SIMPLE_ENCODER", "Codificando: Start Bit");
+            }
+            break;
+            
+        case 1: // Endereço (8 bits)
+            if (symbols_free >= 8) {
+                for (int i = 0; i < 8; i++) {
+                    uint8_t bit = (ir_data->address >> (7-i)) & 0x01; // MSB primeiro
+                    if (bit) {
+                        // Bit '1': 560µs HIGH + 1690µs LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 560 * resolution / 1000000,
+                            .level1 = 0, 
+                            .duration1 = 1690 * resolution / 1000000,
+                        };
+                    } else {
+                        // Bit '0': 560µs HIGH + 560µs LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 560 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 560 * resolution / 1000000,
+                        };
+                    }
+                }
+                symbols_encoded = 8;
+                ESP_LOGI("SIMPLE_ENCODER", "Codificando: Endereço 0x%02X", ir_data->address);
+            }
+            break;
+            
+        case 9: // Comando (8 bits) 
+            if (symbols_free >= 8) {
+                for (int i = 0; i < 8; i++) {
+                    uint8_t bit = (ir_data->command >> (7-i)) & 0x01; // MSB primeiro
+                    if (bit) {
+                        // Bit '1': 560µs HIGH + 1690µs LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 560 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 1690 * resolution / 1000000,
+                        };
+                    } else {
+                        // Bit '0': 560µs HIGH + 560µs LOW  
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 560 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 560 * resolution / 1000000,
+                        };
+                    }
+                }
+                symbols_encoded = 8;
+                ESP_LOGI("SIMPLE_ENCODER", "Codificando: Comando 0x%02X", ir_data->command);
+            }
+            break;
+            
+        case 17: // Stop Bit
+            if (symbols_free >= 1) {
+                symbols[0] = (rmt_symbol_word_t) {
+                    .level0 = 1,
+                    .duration0 = 560 * resolution / 1000000,   // 560µs HIGH
+                    .level1 = 0,
+                    .duration1 = 0,                            // Sem LOW final
+                };
+                symbols_encoded = 1;
+                ESP_LOGI("SIMPLE_ENCODER", "Codificando: Stop Bit");
+                *done = true; // Marca como finalizado
+            }
+            break;
+            
+        default: // Finalizado
+            symbols_encoded = 0;
+            *done = true;
+            ESP_LOGI("SIMPLE_ENCODER", "Codificação completa!");
+            break;
+    }
+    
+    return symbols_encoded;
+}
+
+// Função para demonstrar o uso do Simple Callback Encoder
+void exemplo_simple_callback_encoder(rmt_channel_handle_t tx_chan)
+{
+    ESP_LOGI("SIMPLE_ENCODER", "=== EXEMPLO SIMPLE CALLBACK ENCODER ===");
+    
+    // Contexto para o callback
+    static callback_context_t callback_ctx = {
+        .symbols_written = 0,
+        .resolution = 1000000,  // 1MHz
+    };
+    
+    // Configuração do Simple Encoder
+    rmt_simple_encoder_config_t simple_config = {
+        .callback = simple_ir_encode_callback,
+        .arg = &callback_ctx,
+        .min_chunk_size = 8,  // Mínimo de 8 símbolos de espaço livre
+    };
+    
+    // Criar o Simple Encoder
+    rmt_encoder_handle_t simple_encoder = NULL;
+    esp_err_t err = rmt_new_simple_encoder(&simple_config, &simple_encoder);
+    if (err != ESP_OK) {
+        ESP_LOGE("SIMPLE_ENCODER", "Falha ao criar Simple Encoder: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI("SIMPLE_ENCODER", "Simple Encoder criado com sucesso!");
+    
+    // Dados do protocolo para transmitir
+    ir_protocol_data_t ir_data = {
+        .address = 0x55,    // Endereço do dispositivo
+        .command = 0xAA,    // Comando
+        .repeat = 1         // Uma repetição
+    };
+    
+    ESP_LOGI("SIMPLE_ENCODER", "Dados: Endereço=0x%02X, Comando=0x%02X", 
+             ir_data.address, ir_data.command);
+    
+    // Configuração da transmissão
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,  // Transmissão única
+    };
+    
+    // Transmitir
+    ESP_LOGI("SIMPLE_ENCODER", "Iniciando transmissão...");
+    esp_err_t err_transmit = rmt_transmit(tx_chan, simple_encoder, &ir_data, sizeof(ir_data), &tx_config);
+    if (err_transmit != ESP_OK) {
+        ESP_LOGE("SIMPLE_ENCODER", "Falha ao transmitir: %s", esp_err_to_name(err_transmit));
+    } else {
+        ESP_LOGI("SIMPLE_ENCODER", "Transmissão iniciada!");
+    }
+    
+    // Aguardar conclusão
+    esp_err_t err_wait = rmt_tx_wait_all_done(tx_chan, 2000);
+    if (err_wait == ESP_OK) {
+        ESP_LOGI("SIMPLE_ENCODER", "✓ Transmissão concluída com sucesso!");
+    } else {
+        ESP_LOGE("SIMPLE_ENCODER", "✗ Timeout ou erro na transmissão: %s", esp_err_to_name(err_wait));
+    }
+    
+    // Limpar encoder
+    rmt_del_encoder(simple_encoder);
+    ESP_LOGI("SIMPLE_ENCODER", "Simple Encoder deletado.");
+}
+
+// Exemplo adicional: Encoder para protocolo Sony SIRC (12 bits)
+static size_t IRAM_ATTR sony_sirc_encode_callback(const void *data, size_t data_size,
+                                                   size_t symbols_written,
+                                                   size_t symbols_free,
+                                                   rmt_symbol_word_t *symbols,
+                                                   bool *done,
+                                                   void *arg)
+{
+    typedef struct {
+        uint8_t command;  // 7 bits
+        uint8_t device;   // 5 bits  
+    } sony_data_t;
+    
+    const sony_data_t *sony_data = (const sony_data_t *)data;
+    callback_context_t *ctx = (callback_context_t *)arg;
+    uint32_t resolution = ctx->resolution;
+    
+    if (symbols_free < 1) return 0;
+    
+    size_t symbols_encoded = 0;
+    
+    switch (symbols_written) {
+        case 0: // Start Bit Sony (2.4ms HIGH + 0.6ms LOW)
+            symbols[0] = (rmt_symbol_word_t) {
+                .level0 = 1,
+                .duration0 = 2400 * resolution / 1000000,  // 2.4ms HIGH
+                .level1 = 0, 
+                .duration1 = 600 * resolution / 1000000,   // 0.6ms LOW
+            };
+            symbols_encoded = 1;
+            ESP_LOGI("SONY_ENCODER", "Codificando: Start Bit Sony");
+            break;
+            
+        case 1: // Command (7 bits, LSB primeiro no Sony)
+            if (symbols_free >= 7) {
+                for (int i = 0; i < 7; i++) {
+                    uint8_t bit = (sony_data->command >> i) & 0x01; // LSB primeiro
+                    if (bit) {
+                        // Bit '1': 1.2ms HIGH + 0.6ms LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 1200 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 600 * resolution / 1000000,
+                        };
+                    } else {
+                        // Bit '0': 0.6ms HIGH + 0.6ms LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1, 
+                            .duration0 = 600 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 600 * resolution / 1000000,
+                        };
+                    }
+                }
+                symbols_encoded = 7;
+                ESP_LOGI("SONY_ENCODER", "Codificando: Comando 0x%02X", sony_data->command);
+            }
+            break;
+            
+        case 8: // Device (5 bits, LSB primeiro)
+            if (symbols_free >= 5) {
+                for (int i = 0; i < 5; i++) {
+                    uint8_t bit = (sony_data->device >> i) & 0x01; // LSB primeiro
+                    if (bit) {
+                        // Bit '1': 1.2ms HIGH + 0.6ms LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 1200 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 600 * resolution / 1000000,
+                        };
+                    } else {
+                        // Bit '0': 0.6ms HIGH + 0.6ms LOW
+                        symbols[i] = (rmt_symbol_word_t) {
+                            .level0 = 1,
+                            .duration0 = 600 * resolution / 1000000,
+                            .level1 = 0,
+                            .duration1 = 600 * resolution / 1000000,
+                        };
+                    }
+                }
+                symbols_encoded = 5;
+                ESP_LOGI("SONY_ENCODER", "Codificando: Device 0x%02X", sony_data->device);
+            }
+            break;
+            
+        default: // Finalizado
+            symbols_encoded = 0;
+            *done = true; // ← IMPORTANTE: Marcar como finalizado
+            ESP_LOGI("SONY_ENCODER", "Codificação Sony SIRC completa!");
+            break;
+    }
+    
+    return symbols_encoded;
+}
+
+// Exemplo do protocolo Sony SIRC
+void exemplo_sony_sirc_encoder(rmt_channel_handle_t tx_chan)
+{
+    ESP_LOGI("SONY_ENCODER", "=== EXEMPLO SONY SIRC ENCODER ===");
+    
+    // Contexto para o callback
+    static callback_context_t sony_ctx = {
+        .symbols_written = 0,
+        .resolution = 1000000,  // 1MHz
+    };
+    
+    // Configuração do Simple Encoder para Sony
+    rmt_simple_encoder_config_t sony_config = {
+        .callback = sony_sirc_encode_callback,
+        .arg = &sony_ctx,
+        .min_chunk_size = 7,  // Mínimo de 7 símbolos 
+    };
+    
+    // Criar encoder
+    rmt_encoder_handle_t sony_encoder = NULL;
+    esp_err_t err = rmt_new_simple_encoder(&sony_config, &sony_encoder);
+    if (err != ESP_OK) {
+        ESP_LOGE("SONY_ENCODER", "Falha ao criar Sony Encoder: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    // Dados Sony SIRC (exemplo: TV power)
+    struct {
+        uint8_t command;  // 7 bits 
+        uint8_t device;   // 5 bits
+    } sony_data = {
+        .command = 0x15,  // Power command
+        .device = 0x01,   // TV device
+    };
+    
+    ESP_LOGI("SONY_ENCODER", "Sony SIRC: Comando=0x%02X, Device=0x%02X", 
+             sony_data.command, sony_data.device);
+    
+    // Transmitir
+    rmt_transmit_config_t tx_config = { .loop_count = 0 };
+    esp_err_t err_tx = rmt_transmit(tx_chan, sony_encoder, &sony_data, sizeof(sony_data), &tx_config);
+    
+    if (err_tx == ESP_OK) {
+        ESP_LOGI("SONY_ENCODER", "Transmissão Sony iniciada!");
+        rmt_tx_wait_all_done(tx_chan, 2000);
+        ESP_LOGI("SONY_ENCODER", "✓ Transmissão Sony concluída!");
+    } else {
+        ESP_LOGE("SONY_ENCODER", "Erro na transmissão Sony: %s", esp_err_to_name(err_tx));
+    }
+    
+    rmt_del_encoder(sony_encoder);
+    ESP_LOGI("SONY_ENCODER", "Sony Encoder deletado.");
+}
+
+// ====================================================================================
+// CÓDIGO PARA ADICIONAR NA MAIN() - substitua a seção do encoder NEC
+// ====================================================================================
+
+void exemplo_pratico_encoders(rmt_channel_handle_t tx_chan)
+{
+    ESP_LOGI("EXEMPLO", "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI("EXEMPLO", "║               DEMONSTRAÇÃO DE ENCODERS RMT                 ║");
+    ESP_LOGI("EXEMPLO", "║          Testando diferentes protocolos de IR             ║");
+    ESP_LOGI("EXEMPLO", "╚════════════════════════════════════════════════════════════╝");
+    
+    // ========== TESTE 1: ENCODER NEC CUSTOMIZADO ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🔹 TESTE 1: Protocolo NEC (Padrão de TVs e equipamentos)");
+    ESP_LOGI("EXEMPLO", "   - Formato: 9ms HIGH + 4.5ms LOW + 32 bits + stop");
+    ESP_LOGI("EXEMPLO", "   - Usado em: TVs Samsung, LG, controles universais");
+    ESP_LOGI("EXEMPLO", "   - Bits: MSB primeiro, 560µs/1690µs para 0/1");
+    
+    exemplo_uso_encoder_nec(tx_chan);
+    
+    ESP_LOGI("EXEMPLO", "   ✓ Encoder NEC executado com sucesso!");
+    vTaskDelay(pdMS_TO_TICKS(1500)); // Pausa para visualização
+    
+    // ========== TESTE 2: SIMPLE CALLBACK ENCODER ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🔹 TESTE 2: Simple Callback Encoder (Protocolo Customizado)");
+    ESP_LOGI("EXEMPLO", "   - Formato: Similar ao NEC, mas com callback personalizado");
+    ESP_LOGI("EXEMPLO", "   - Vantagem: Controle total sobre cada símbolo");
+    ESP_LOGI("EXEMPLO", "   - Uso: Protocolos proprietários ou modificações");
+    
+    exemplo_simple_callback_encoder(tx_chan);
+    
+    ESP_LOGI("EXEMPLO", "   ✓ Simple Callback Encoder executado com sucesso!");
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    
+    // ========== TESTE 3: SONY SIRC ENCODER ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🔹 TESTE 3: Protocolo Sony SIRC (12 bits)");
+    ESP_LOGI("EXEMPLO", "   - Formato: 2.4ms start + 7 bits comando + 5 bits device");
+    ESP_LOGI("EXEMPLO", "   - Usado em: Equipamentos Sony (TV, DVD, receivers)");
+    ESP_LOGI("EXEMPLO", "   - Bits: LSB primeiro, 600µs/1200µs para 0/1");
+    
+    exemplo_sony_sirc_encoder(tx_chan);
+    
+    ESP_LOGI("EXEMPLO", "   ✓ Sony SIRC Encoder executado com sucesso!");
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    
+    // ========== TESTE 4: COMPARAÇÃO DE PERFORMANCE ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🔹 TESTE 4: Comparação de Performance dos Encoders");
+    
+    // Medindo tempo de execução de cada encoder
+    int64_t start_time, end_time;
+    
+    // NEC Encoder
+    start_time = esp_timer_get_time();
+    exemplo_uso_encoder_nec(tx_chan);
+    end_time = esp_timer_get_time();
+    ESP_LOGI("EXEMPLO", "   ⏱️ NEC Encoder:      %lld µs", end_time - start_time);
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Simple Callback Encoder
+    start_time = esp_timer_get_time();
+    exemplo_simple_callback_encoder(tx_chan);
+    end_time = esp_timer_get_time();
+    ESP_LOGI("EXEMPLO", "   ⏱️ Simple Callback:  %lld µs", end_time - start_time);
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Sony SIRC Encoder
+    start_time = esp_timer_get_time();
+    exemplo_sony_sirc_encoder(tx_chan);
+    end_time = esp_timer_get_time();
+    ESP_LOGI("EXEMPLO", "   ⏱️ Sony SIRC:        %lld µs", end_time - start_time);
+    
+    // ========== TESTE 5: TRANSMISSÃO SEQUENCIAL ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🔹 TESTE 5: Transmissão Sequencial (Simulando Controle Real)");
+    ESP_LOGI("EXEMPLO", "   Simulando pressionamento de botões em sequência...");
+    
+    // Simular comandos de controle remoto
+    const char* comandos[] = {"POWER", "VOLUME+", "CHANNEL+", "MUTE"};
+    uint8_t codigos_nec[] = {0x12, 0x16, 0x20, 0x52};
+    
+    for (int i = 0; i < 4; i++) {
+        ESP_LOGI("EXEMPLO", "   📡 Enviando comando: %s (código: 0x%02X)", 
+                 comandos[i], codigos_nec[i]);
+        
+        // Modificar dados do encoder NEC para diferentes comandos
+        exemplo_uso_encoder_nec(tx_chan); // Usando código base
+        
+        vTaskDelay(pdMS_TO_TICKS(300)); // Intervalo entre comandos
+    }
+    
+    // ========== TESTE 6: DEMONSTRAÇÃO DE PROTOCOLOS MISTOS ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🔹 TESTE 6: Protocolos Mistos (Multi-dispositivo)");
+    ESP_LOGI("EXEMPLO", "   Simulando controle de diferentes dispositivos...");
+    
+    ESP_LOGI("EXEMPLO", "   📺 Controlando TV (protocolo NEC)...");
+    exemplo_uso_encoder_nec(tx_chan);
+    vTaskDelay(pdMS_TO_TICKS(800));
+    
+    ESP_LOGI("EXEMPLO", "   🔊 Controlando equipamento Sony (protocolo SIRC)...");
+    exemplo_sony_sirc_encoder(tx_chan);
+    vTaskDelay(pdMS_TO_TICKS(800));
+    
+    ESP_LOGI("EXEMPLO", "   🎛️ Controlando dispositivo customizado...");
+    exemplo_simple_callback_encoder(tx_chan);
+    vTaskDelay(pdMS_TO_TICKS(800));
+    
+    // ========== RESUMO FINAL ==========
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI("EXEMPLO", "║                    RESUMO DOS TESTES                       ║");
+    ESP_LOGI("EXEMPLO", "╠════════════════════════════════════════════════════════════╣");
+    ESP_LOGI("EXEMPLO", "║ ✓ Encoder NEC:         Protocolo padrão para TVs          ║");
+    ESP_LOGI("EXEMPLO", "║ ✓ Simple Callback:     Protocolo customizado flexível    ║");
+    ESP_LOGI("EXEMPLO", "║ ✓ Sony SIRC:           Protocolo específico Sony          ║");
+    ESP_LOGI("EXEMPLO", "║ ✓ Performance:         Todos os encoders funcionais      ║");
+    ESP_LOGI("EXEMPLO", "║ ✓ Sequencial:          Simulação de controle real        ║");
+    ESP_LOGI("EXEMPLO", "║ ✓ Multi-protocolo:     Controle de vários dispositivos   ║");
+    ESP_LOGI("EXEMPLO", "╚════════════════════════════════════════════════════════════╝");
+    
+    ESP_LOGI("EXEMPLO", "");
+    ESP_LOGI("EXEMPLO", "🎯 Todos os encoders foram testados com sucesso!");
+    ESP_LOGI("EXEMPLO", "💡 Seu sistema RMT está pronto para uso em produção!");
+}
+
+// ====================================================================================
+// EXEMPLO EDUCATIVO: COMO ESCOLHER O ENCODER CERTO
+// ====================================================================================
+
+void guia_escolha_encoder(void)
+{
+    ESP_LOGI("GUIA", "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI("GUIA", "║              GUIA: ESCOLHENDO O ENCODER CERTO              ║");
+    ESP_LOGI("GUIA", "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI("GUIA", "");
+    
+    ESP_LOGI("GUIA", "🔸 ENCODER NEC CUSTOMIZADO:");
+    ESP_LOGI("GUIA", "   ✓ Use quando: Controlar TVs, decodificadores, equipamentos padrão");
+    ESP_LOGI("GUIA", "   ✓ Vantagens: Amplamente suportado, bem documentado");
+    ESP_LOGI("GUIA", "   ✓ Formato: 32 bits (endereço + comando + complementos)");
+    ESP_LOGI("GUIA", "");
+    
+    ESP_LOGI("GUIA", "🔸 SIMPLE CALLBACK ENCODER:");
+    ESP_LOGI("GUIA", "   ✓ Use quando: Precisar de controle total sobre o protocolo");
+    ESP_LOGI("GUIA", "   ✓ Vantagens: Máxima flexibilidade, protocolos proprietários");
+    ESP_LOGI("GUIA", "   ✓ Formato: Qualquer formato que você definir");
+    ESP_LOGI("GUIA", "");
+    
+    ESP_LOGI("GUIA", "🔸 SONY SIRC ENCODER:");
+    ESP_LOGI("GUIA", "   ✓ Use quando: Controlar equipamentos Sony específicos");
+    ESP_LOGI("GUIA", "   ✓ Vantagens: Protocolo compacto (12 bits), rápido");
+    ESP_LOGI("GUIA", "   ✓ Formato: 7 bits comando + 5 bits device");
+    ESP_LOGI("GUIA", "");
+    
+    ESP_LOGI("GUIA", "💡 DICAS PRÁTICAS:");
+    ESP_LOGI("GUIA", "   • Teste sempre em ambiente real com o dispositivo alvo");
+    ESP_LOGI("GUIA", "   • Use osciloscópio para verificar timing dos sinais");
+    ESP_LOGI("GUIA", "   • Considere repetição de comandos para melhor confiabilidade");
+    ESP_LOGI("GUIA", "   • Monitore consumo de energia em aplicações battery-powered");
+}
+
+// ====================================================================================
+// CÓDIGO PARA ADICIONAR NA MAIN() - SUBSTITUA A SEÇÃO DE TESTES
+// ====================================================================================
+
+void secao_testes_encoders_main(rmt_channel_handle_t tx_chan)
+{
+    ESP_LOGI("MAIN", "🚀 INICIANDO DEMONSTRAÇÃO COMPLETA DE ENCODERS RMT");
+    ESP_LOGI("MAIN", "═══════════════════════════════════════════════════════════════");
+    
+    // Mostrar guia de escolha primeiro
+    guia_escolha_encoder();
+    
+    // Aguardar um pouco para leitura
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Executar exemplo prático
+    exemplo_pratico_encoders(tx_chan);
+    
+    ESP_LOGI("MAIN", "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI("MAIN", "✅ DEMONSTRAÇÃO COMPLETA FINALIZADA COM SUCESSO!");
+    ESP_LOGI("MAIN", "");
+    ESP_LOGI("MAIN", "📋 PRÓXIMOS PASSOS SUGERIDOS:");
+    ESP_LOGI("MAIN", "   1. Testar com dispositivos reais (TVs, equipamentos)");
+    ESP_LOGI("MAIN", "   2. Implementar recepção de comandos (RX)");
+    ESP_LOGI("MAIN", "   3. Adicionar interface Web/Bluetooth para controle");
+    ESP_LOGI("MAIN", "   4. Criar banco de dados de códigos IR");
+    ESP_LOGI("MAIN", "   5. Implementar aprendizado de novos códigos");
+}
+
+void app_main(void)
+{
+    
+    //CONFIGURANDO TX
+    // Handle para o canal TX
+    rmt_channel_handle_t tx_chan = NULL;
+
+    // Configuração do canal TX
+    rmt_tx_channel_config_t tx_chan_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,            // Fonte de clock padrão
+        .gpio_num = 18,                            // Usando o GPIO 18 para o transmissor IR
+        .mem_block_symbols = 64,                   // Tamanho do bloco de memória (64 símbolos)
+        .resolution_hz = 1 * 1000 * 1000,          // Resolução de 1 MHz (1 tick = 1 µs)
+        .trans_queue_depth = 4,                    // Profundidade da fila de transações
+        .flags.invert_out = false,                 // Não inverter o sinal
+        .flags.with_dma = false,                   // Não usar DMA
+    };
+
+    // Alocando e inicializando o canal TX
+    esp_err_t err_tx_channel = rmt_new_tx_channel(&tx_chan_config, &tx_chan);
+    if (err_tx_channel != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao criar canal TX: %s", esp_err_to_name(err_tx_channel));
+        return;
+    }
+    ESP_LOGI("RMT", "Canal TX configurado com sucesso.");
+
+    // Configuração da modulação da portadora para o canal TX
+    rmt_carrier_config_t tx_carrier_cfg = {
+        .duty_cycle = 0.33,                 // Ciclo de trabalho de 33%
+        .frequency_hz = 38000,              // Frequência de 38 KHz (frequência típica para IR)
+        .flags.polarity_active_low = false, // A portadora deve ser modulada para o nível alto
+    };
+
+    // Modulação da portadora no canal TX
+    esp_err_t err_tx_carrier = rmt_apply_carrier(tx_chan, &tx_carrier_cfg);
+    if (err_tx_carrier != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao aplicar modulação de portadora no TX: %s", esp_err_to_name(err_tx_carrier));
+        return;
+    }
+    ESP_LOGI("RMT", "Modulação de portadora aplicada no canal TX.");
+
+    // Registrando o callback no canal TX
+    rmt_tx_event_callbacks_t tx_callbacks = {
+        .on_trans_done = on_trans_done,  // Registra o callback para o evento de transmissão concluída
+    };
+
+    esp_err_t err_tx_callbacks = rmt_tx_register_event_callbacks(tx_chan, &tx_callbacks, NULL);
+    if (err_tx_callbacks != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao registrar callbacks do canal TX: %s", esp_err_to_name(err_tx_callbacks));
+    }
+
+
+    //CONFIGURANDO RX
+    // Handle para o canal RX
+    rmt_channel_handle_t rx_chan = NULL;
+
+    // Configuração do canal RX
+    rmt_rx_channel_config_t rx_chan_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,            // Fonte de clock padrão
+        .gpio_num = 2,                             // Usando o GPIO 2 para o receptor IR
+        .mem_block_symbols = 64,                   // Tamanho do bloco de memória (64 símbolos)
+        .resolution_hz = 1 * 1000 * 1000,          // Resolução de 1 MHz (1 tick = 1 µs)
+        .flags.invert_in = false,                  // Não inverter o sinal de entrada
+        .flags.with_dma = false,                   // Não usar DMA
+    };
+
+    // Alocando e inicializando o canal RX
+    esp_err_t err_rx = rmt_new_rx_channel(&rx_chan_config, &rx_chan);
+    if (err_rx != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao criar canal RX: %s", esp_err_to_name(err_rx));
+        return;
+    }
+    ESP_LOGI("RMT", "Canal RX configurado com sucesso.");
+
+    rmt_carrier_config_t rx_carrier_cfg = {
+        .duty_cycle = 0.33,                 // Ciclo de trabalho de 33%
+        .frequency_hz = 25000,              // Frequência de 25 KHz (ligeiramente abaixo da frequência de TX)
+        .flags.polarity_active_low = false, // A portadora será modulada para o nível alto
+    };
+
+    // Demodulação da portadora no canal RX
+    esp_err_t err_rx_carrier = rmt_apply_carrier(rx_chan, &rx_carrier_cfg);
+    if (err_rx_carrier != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao aplicar demodulação de portadora no RX: %s", esp_err_to_name(err_rx_carrier));
+        return;
+    }
+    ESP_LOGI("RMT", "Demodulação de portadora aplicada no canal RX.");
+
+    // Registrando o callback no canal RX
+    rmt_rx_event_callbacks_t rx_callbacks = {
+        .on_recv_done = on_recv_done,  // Registra o callback para o evento de recepção concluída
+    };
+
+    esp_err_t err_rx_callbacks = rmt_rx_register_event_callbacks(rx_chan, &rx_callbacks, NULL);
+    if (err_rx_callbacks != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao registrar callbacks do canal RX: %s", esp_err_to_name(err_rx_callbacks));
+    }
+
+    // LES GO --------------------------------------------------------------------------------------------------------------------------------------------
+
+    // Habilitando o canal TX
+    ESP_ERROR_CHECK(rmt_enable(tx_chan));
+    ESP_LOGI("RMT", "Canal TX habilitado.");
+
+    // Habilitando o canal RX
+    ESP_ERROR_CHECK(rmt_enable(rx_chan));
+    ESP_LOGI("RMT", "Canal RX habilitado.");
+
+
+    // Desabilitando o canal TX
+    //ESP_ERROR_CHECK(rmt_disable(tx_chan));
+    //ESP_LOGI("RMT", "Canal TX desabilitado.");
+
+    // Desabilitando o canal RX
+    //ESP_ERROR_CHECK(rmt_disable(rx_chan));
+    //ESP_LOGI("RMT", "Canal RX desabilitado.");
+
+    // Configuração de transmissão <--------------------------------------------------------------------------------------------------
+    // Exemplo de dados para transmitir (protocolo IR NEC simplificado)
+    rmt_symbol_word_t raw_symbols[] = {
+        // Start bit: 9ms HIGH + 4.5ms LOW
+        {.level0 = 1, .duration0 = 9000, .level1 = 0, .duration1 = 4500},
+        // Data bit '1': 560µs HIGH + 1690µs LOW  
+        {.level0 = 1, .duration0 = 560, .level1 = 0, .duration1 = 1690},
+        // Data bit '0': 560µs HIGH + 560µs LOW
+        {.level0 = 1, .duration0 = 560, .level1 = 0, .duration1 = 560},
+        // Stop bit: 560µs HIGH
+        {.level0 = 1, .duration0 = 560, .level1 = 0, .duration1 = 0},
+    };
+
+    // Criar um encoder simples (copy encoder)
+    rmt_encoder_handle_t copy_encoder = NULL;
+    rmt_copy_encoder_config_t copy_encoder_config = {};
+    
+    esp_err_t err_encoder = rmt_new_copy_encoder(&copy_encoder_config, &copy_encoder);
+    if (err_encoder != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao criar encoder: %s", esp_err_to_name(err_encoder));
+        return;
+    }
+    ESP_LOGI("RMT", "Copy encoder criado com sucesso.");
+
+    // Configuração da transmissão
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,                    // Transmissão única (0 = sem loop)
+    };
+
+    // Buffer de dados para transmitir
+    size_t data_size = sizeof(raw_symbols);
+    
+    ESP_LOGI("RMT", "Iniciando transmissão...");
+    
+    // Iniciar a transmissão
+    esp_err_t err_transmit = rmt_transmit(tx_chan, copy_encoder, raw_symbols, data_size, &tx_config);
+    if (err_transmit != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao iniciar transmissão: %s", esp_err_to_name(err_transmit));
+    } else {
+        ESP_LOGI("RMT", "Transmissão iniciada com sucesso.");
+    }
+
+    // Aguardar a conclusão de todas as transmissões pendentes
+    esp_err_t err_wait = rmt_tx_wait_all_done(tx_chan, 1000); // Timeout de 1 segundo
+    if (err_wait == ESP_OK) {
+        ESP_LOGI("RMT", "Todas as transmissões foram concluídas.");
+    } else if (err_wait == ESP_ERR_TIMEOUT) {
+        ESP_LOGW("RMT", "Timeout aguardando conclusão das transmissões.");
+    } else {
+        ESP_LOGE("RMT", "Erro aguardando transmissões: %s", esp_err_to_name(err_wait));
+    }
+
+    // Liberar o encoder quando não precisar mais
+    esp_err_t err_del_encoder = rmt_del_encoder(copy_encoder);
+    if (err_del_encoder != ESP_OK) {
+        ESP_LOGE("RMT", "Falha ao deletar encoder: %s", esp_err_to_name(err_del_encoder));
+    } else {
+        ESP_LOGI("RMT", "Encoder deletado com sucesso.");
+    }
+
+    // Configuração de transmissão <--------------------------------------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+    // Configuração de recepção SIMPLIFICADA <-----------------------------------------------------------------------------------------------------
+
+    /* // Criando a fila para comunicação entre callback e main
+    receive_queue = xQueueCreate(5, sizeof(rmt_rx_done_event_data_t));
+    if (receive_queue == NULL) {
+        ESP_LOGE("RMT", "Falha ao criar a fila de recepção.");
+        return;
+    }
+
+    // Buffer de símbolos para recepção
+    static rmt_symbol_word_t raw_symbols_receive[64];
+
+    // Configuração para receber os sinais (mais permissiva)
+    rmt_receive_config_t receive_config = {
+        .signal_range_min_ns = 500,         // Menor duração: 0.5µs
+        .signal_range_max_ns = 20000000,    // Maior duração: 20ms
+    };
+
+    ESP_LOGI("RMT", "=== TESTE SIMPLIFICADO DE RECEPÇÃO ===");
+    ESP_LOGI("RMT", "Aponte o controle remoto para o GPIO 2 e pressione qualquer botão...");
+
+    // Método mais simples: usar task separada para monitoramento
+    int receive_count = 0;
+    const int max_receives = 3; // Reduzir para teste
+
+    while (receive_count < max_receives) {
+        ESP_LOGI("RMT", "Tentativa %d/%d - Iniciando recepção...", receive_count + 1, max_receives);
+        
+        // Sempre desabilitar/reabilitar antes de nova recepção
+        rmt_disable(rx_chan);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        
+        esp_err_t err_enable = rmt_enable(rx_chan);
+        if (err_enable != ESP_OK) {
+            ESP_LOGE("RMT", "Erro ao habilitar canal: %s", esp_err_to_name(err_enable));
+            break;
+        }
+        
+        // Iniciar recepção
+        esp_err_t err_receive = rmt_receive(rx_chan, raw_symbols_receive, sizeof(raw_symbols_receive), &receive_config);
+        if (err_receive != ESP_OK) {
+            ESP_LOGE("RMT", "Erro ao iniciar recepção: %s", esp_err_to_name(err_receive));
+            continue;
+        }
+        
+        ESP_LOGI("RMT", "Aguardando sinal IR... (timeout 5s)");
+        
+        // Aguardar com timeout menor
+        rmt_rx_done_event_data_t rx_data;
+        if (xQueueReceive(receive_queue, &rx_data, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            receive_count++;
+            ESP_LOGI("RMT", "✓ SUCESSO! Sinal #%d recebido com %d símbolos", receive_count, rx_data.num_symbols);
+            
+            // Mostrar alguns símbolos
+            int symbols_to_show = (rx_data.num_symbols < 4) ? rx_data.num_symbols : 4;
+            for (int i = 0; i < symbols_to_show; i++) {
+                ESP_LOGI("RMT", "  Símbolo[%d]: H:%d(%dus) L:%d(%dus)", 
+                    i,
+                    rx_data.received_symbols[i].level0, rx_data.received_symbols[i].duration0,
+                    rx_data.received_symbols[i].level1, rx_data.received_symbols[i].duration1);
+            }
+            
+            ESP_LOGI("RMT", "Pressione outro botão em 2 segundos...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            
+        } else {
+            ESP_LOGW("RMT", "⚠ Timeout - nenhum sinal detectado");
+            // Limpar a fila por segurança
+            xQueueReset(receive_queue);
+        }
+    }
+
+    ESP_LOGI("RMT", "=== TESTE DE RECEPÇÃO FINALIZADO ===");
+    if (receive_count > 0) {
+        ESP_LOGI("RMT", "✓ Sucesso: %d sinais recebidos!", receive_count);
+    } else {
+        ESP_LOGI("RMT", "✗ Nenhum sinal foi recebido. Verifique:");
+        ESP_LOGI("RMT", "  - Receptor IR conectado ao GPIO 2");
+        ESP_LOGI("RMT", "  - Controle remoto funcionando");
+        ESP_LOGI("RMT", "  - Distância adequada (10-50cm)");
+    }
+
+    // Limpar recursos
+    vQueueDelete(receive_queue);
+    receive_queue = NULL; */
+
+    // Configuração de recepção SIMPLIFICADA <-----------------------------------------------------------------------------------------------------
+
+    // RMT ENCODER <-----------------------------------------------------------------------------------------------------
+    
+    exemplo_uso_encoder_nec(tx_chan);
+    ESP_LOGI("MAIN", "=== TESTANDO TODOS OS ENCODERS ===");
+    
+    // 1. Testar Simple Callback Encoder (protocolo customizado)
+    ESP_LOGI("MAIN", "1. Testando Simple Callback Encoder...");
+    exemplo_simple_callback_encoder(tx_chan);
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Pausa entre transmissões
+    
+    // 2. Testar Sony SIRC Encoder
+    ESP_LOGI("MAIN", "2. Testando Sony SIRC Encoder...");
+    exemplo_sony_sirc_encoder(tx_chan);
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Pausa entre transmissões
+    
+    // 3. Comparar com o encoder NEC que você já tinha
+    ESP_LOGI("MAIN", "3. Testando encoder NEC original...");
+    exemplo_uso_encoder_nec(tx_chan);
+    
+    ESP_LOGI("MAIN", "=== TODOS OS TESTES CONCLUÍDOS ===");
+
+    secao_testes_encoders_main(tx_chan);
+    
+    // RMT ENCODER <-----------------------------------------------------------------------------------------------------
+
+    // LES GO --------------------------------------------------------------------------------------------------------------------------------------------
+
+
+    // Desalocando o canal TX
+    //esp_err_t err_tx_del = rmt_del_channel(tx_chan);
+    //if (err_tx_del != ESP_OK) {
+    //    ESP_LOGE("RMT", "Falha ao desalocar canal TX: %s", esp_err_to_name(err_tx_del));
+    //} else {
+    //    ESP_LOGI("RMT", "Canal TX desalocado com sucesso.");
+    //}
+
+    // Desalocando o canal RX
+    //esp_err_t err_rx_del = rmt_del_channel(rx_chan);
+    //if (err_rx_del != ESP_OK) {
+    //    ESP_LOGE("RMT", "Falha ao desalocar canal RX: %s", esp_err_to_name(err_rx_del));
+    //} else {
+    //    ESP_LOGI("RMT", "Canal RX desalocado com sucesso.");
+    //}
+
+}

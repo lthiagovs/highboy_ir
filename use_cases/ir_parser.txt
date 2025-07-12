@@ -1,0 +1,83 @@
+como usar?
+
+--------------------------------------------------------------------
+
+#include <stdio.h>
+#include "ir_parser.h"
+#include "ir_transmitter.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+const char *flipper_ir_text = 
+"; Filetype: IR Signal\n"
+"Version: 1\n"
+"Name: TV_Samsung_Power\n"
+"Brand: Samsung\n"
+"Device: TV\n"
+"Frequency: 38000\n"
+"Protocol: NEC\n"
+"Address: 0xE0E0\n"
+"Command: 0x40BF\n";
+
+void app_main(void)
+{
+    ir_data_t data;
+
+    // Faz parse do texto IR para estrutura interna
+    if (!ir_to_data(flipper_ir_text, &data)) {
+        printf("Erro ao fazer parse do arquivo IR\n");
+        return;
+    }
+
+    printf("Enviando comando NEC do arquivo IR...\n");
+
+    // Envia o comando usando a função simplificada (que já faz init se necessário)
+    ir_transmitter_send_command(data.nec.address, data.nec.command);
+    printf("Comando enviado com sucesso!\n");
+
+    while (1) {
+        ir_transmitter_send_command(data.nec.address, data.nec.command);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+---------------------------------------------------------------------
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "ir_receiver.h"
+#include "ir_parser.h"
+
+void app_main(void) {
+    uint32_t raw_data[] = {
+        0, 2632, 920, 415, 918, 413, 500, 387,
+        471, 1304, 1366, 412, 499, 389, 499, 388,
+        417, 473, 499, 389, 464, 422, 468, 422,
+        499, 388, 499, 387, 503, 386, 501, 387,
+        501, 832, 500, 386, 921, 411, 503, 386,
+        81690, 2631, 921, 413, 920, 412, 499, 389,
+        500, 1273, 1366, 414, 500, 385, 468, 421,
+        502, 387, 500, 387, 502, 387, 468, 419,
+        416, 472, 502, 386, 469, 419, 502, 386,
+        473, 858, 503, 386, 921, 412, 501, 385
+    };
+
+    size_t length = sizeof(raw_data) / sizeof(raw_data[0]);
+
+    char *ir_string = raw_to_ir_string(raw_data, length, "TV_Samsung_Power", 38000);
+    if (ir_string) {
+        printf("%s", ir_string);
+        free(ir_string);
+    } else {
+        printf("Erro ao alocar memória para IR string\n");
+    }
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+------------------------------------------
+
+TUDO OK
