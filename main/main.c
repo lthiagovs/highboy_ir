@@ -15,7 +15,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Transmitindo arquivo RECEBIDO.ir");
     
     // Chama a função para transmitir o arquivo
-    if (ir_transmit_file("RECEBIDO.ir")) {
+    if (ir_transmit_file("RECEBIDO.ir",10)) {
         ESP_LOGI(TAG, "Transmissão do arquivo RECEBIDO.ir concluída com sucesso!");
     } else {
         ESP_LOGE(TAG, "Falha na transmissão do arquivo RECEBIDO.ir");

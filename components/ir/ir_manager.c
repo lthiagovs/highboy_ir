@@ -21,7 +21,7 @@
 
 #define TAG "MANAGER"
 
-bool ir_transmit_file(const char* ir_filename){
+bool ir_transmit_file(const char* ir_filename, int transmit_count){
 
     if (ir_path_init() != IR_PATH_OK) {
         ESP_LOGE(TAG, "Falha ao inicializar SD card");
@@ -85,8 +85,8 @@ bool ir_transmit_file(const char* ir_filename){
             // === TRANSMISSÃO ===
             ESP_LOGI(TAG, "\n=== INICIANDO TRANSMISSÃO ===");
             
-            for (int i = 0; i < 5; i++) {
-                ESP_LOGI(TAG, "Transmissão %d/5: %s", i + 1, file_data.name);
+            for (int i = 0; i < transmit_count; i++) {
+                ESP_LOGI(TAG, "Transmissão %d/%d: %s", i + 1, transmit_count, file_data.name);
                 
                 if (ir_file_transmit(&file_data, ir_encoder)) {
                     ESP_LOGI(TAG, "Transmissão %d OK!", i + 1);
