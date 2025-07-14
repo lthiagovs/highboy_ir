@@ -34,7 +34,8 @@
     "esp_system.h": "c",
     "ir_path.h": "c",
     "ir_receiver.h": "c",
-    "stdbool.h": "c"
+    "stdbool.h": "c",
+    "time.h": "c"
   },
   "idf.flashType": "UART"
 }

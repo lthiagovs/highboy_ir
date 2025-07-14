@@ -161,8 +161,8 @@ bool ir_receive_file(const char* filename, rmt_symbol_word_t* raw_symbols){
     if (rmt_rx_receive_once(raw_symbols, MEM_BLOCK_SYMBOLS, &received)) {
         ESP_LOGI(TAG, "Recebido %d símbolos IR", (int)received);
         
-        // PROCESSA O SINAL IR (tudo modularizado)
-        process_ir_signal(raw_symbols, received);
+        // PROCESSA O SINAL IR passando o nome do arquivo
+        process_ir_signal_filename(raw_symbols, received, filename);
         
     } else {
         ESP_LOGE(TAG, "Timeout - nenhum sinal recebido");

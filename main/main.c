@@ -12,13 +12,13 @@
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Transmitindo arquivo RC6_73.ir");
+    ESP_LOGI(TAG, "Transmitindo arquivo RECEBIDO.ir");
     
     // Chama a função para transmitir o arquivo
-    if (ir_transmit_file("RC6_73.ir")) {
-        ESP_LOGI(TAG, "Transmissão do arquivo RC6_73.ir concluída com sucesso!");
+    if (ir_transmit_file("RECEBIDO.ir")) {
+        ESP_LOGI(TAG, "Transmissão do arquivo RECEBIDO.ir concluída com sucesso!");
     } else {
-        ESP_LOGE(TAG, "Falha na transmissão do arquivo RC6_73.ir");
+        ESP_LOGE(TAG, "Falha na transmissão do arquivo RECEBIDO.ir");
     }
     
     ESP_LOGI(TAG, "Aplicação finalizada");
