@@ -137,7 +137,7 @@ bool ir_transmit_file(const char* ir_filename, int transmit_count){
     } */
 }
 
-bool ir_receive_file(const char* filename, rmt_symbol_word_t* raw_symbols){
+bool ir_receive_file(const char* filename, rmt_symbol_word_t* raw_symbols, uint32_t timeout_ms){
     ESP_LOGI(TAG, "Inicializando receptor IR...");
 
     // Inicializa o módulo
@@ -158,7 +158,7 @@ bool ir_receive_file(const char* filename, rmt_symbol_word_t* raw_symbols){
 
     size_t received = 0;
 
-    if (rmt_rx_receive_once(raw_symbols, MEM_BLOCK_SYMBOLS, &received)) {
+    if (rmt_rx_receive_once(raw_symbols, MEM_BLOCK_SYMBOLS, &received, timeout_ms)) {
         ESP_LOGI(TAG, "Recebido %d símbolos IR", (int)received);
         
         // PROCESSA O SINAL IR passando o nome do arquivo

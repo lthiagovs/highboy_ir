@@ -89,7 +89,7 @@ bool rmt_rx_receive_repeat(rmt_symbol_word_t *raw_symbols_receive);
  * @param symbols_received ponteiro opcional para retornar a quantidade recebida
  * @return true se recebeu com sucesso, false se timeout
  */
-bool rmt_rx_receive_once(rmt_symbol_word_t *raw_symbols_receive, size_t max_symbols, size_t *symbols_received);
+bool rmt_rx_receive_once(rmt_symbol_word_t *raw_symbols_receive, size_t max_symbols, size_t *symbols_received, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

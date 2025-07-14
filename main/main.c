@@ -12,19 +12,6 @@
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Transmitindo arquivo RECEBIDO.ir");
-    
-    // Chama a função para transmitir o arquivo
-    if (ir_transmit_file("RECEBIDO.ir",10)) {
-        ESP_LOGI(TAG, "Transmissão do arquivo RECEBIDO.ir concluída com sucesso!");
-    } else {
-        ESP_LOGE(TAG, "Falha na transmissão do arquivo RECEBIDO.ir");
-    }
-    
-    ESP_LOGI(TAG, "Aplicação finalizada");
-    
-    // Loop infinito ou outras tarefas
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    }
+    static rmt_symbol_word_t raw_symbols[MEM_BLOCK_SYMBOLS];
+    ir_receive_file("TESTANDO.ir", raw_symbols, 5000);
 }

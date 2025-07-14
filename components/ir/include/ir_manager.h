@@ -10,6 +10,6 @@
 bool ir_init();
 
 bool ir_transmit_file();
-bool ir_receive_file(const char* filename, rmt_symbol_word_t* raw_symbols);
+bool ir_receive_file(const char* filename, rmt_symbol_word_t* raw_symbols, uint32_t timeout_ms);
 
 #endif // IR_MANAGER_H

@@ -201,7 +201,7 @@ bool rmt_rx_receive_repeat(rmt_symbol_word_t *raw_symbols_receive){
 
 }
 
-bool rmt_rx_receive_once(rmt_symbol_word_t *raw_symbols_receive, size_t max_symbols, size_t *symbols_received) {
+bool rmt_rx_receive_once(rmt_symbol_word_t *raw_symbols_receive, size_t max_symbols, size_t *symbols_received, uint32_t timeout_ms) {
 
     ESP_LOGI("RMT", "INICIANDO RECEPÇÃO");
 
@@ -218,7 +218,7 @@ bool rmt_rx_receive_once(rmt_symbol_word_t *raw_symbols_receive, size_t max_symb
     ESP_LOGI("RMT", "AGUARDANDO SINAL IR...");
 
     rmt_rx_done_event_data_t rx_data;
-    if (xQueueReceive(receive_queue, &rx_data, pdMS_TO_TICKS(10000)) == pdTRUE) {  // Alterado para 10 segundos
+    if (xQueueReceive(receive_queue, &rx_data, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
         size_t n = rx_data.num_symbols;
 
         if (symbols_received) *symbols_received = n;
