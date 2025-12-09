@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "ir_common.h"
+#include "ir_protocol.h"
 #include "ir_rx.h"
 
 static rmt_channel_handle_t rx_chan = NULL;
@@ -103,7 +104,13 @@ rmt_symbol_word_t* ir_rx_receive(){
 
     if (xQueueReceive(receive_queue, &rx_data, pdMS_TO_TICKS(1000)) == pdPASS) {
 
+        //HANDLE THE SIGNAL
+        
         print_signal(rx_data.received_symbols, rx_data.num_symbols);
+        save_signal(rx_data.received_symbols, rx_data.num_symbols);
+
+        //HANDLE THE SIGNAL
+
         ESP_ERROR_CHECK(rmt_receive(rx_chan, raw_symbols, sizeof(raw_symbols), &receive_config));
 
     }
