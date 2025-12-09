@@ -9,6 +9,7 @@ typedef enum PROTOCOLS { IR_UNKNOW_PROTOCOL, IR_PROTOCOL_NEC, IR_PROTOCOL_RC6, I
 
 typedef struct IR_DATA
 {
+    char NAME[64];
     IR_PROTOCOL PROTOCOL;
     uint16_t ADDRESS;
     uint16_t COMMAND;
@@ -17,7 +18,10 @@ typedef struct IR_DATA
 } IR_DATA;
 
 
-IR_PROTOCOL get_protocol(rmt_symbol_word_t* raw_data);
+IR_PROTOCOL get_protocol(size_t signal_size);
 bool duration_in_range(uint32_t signal_duration, uint32_t spec_duration);
+
+void irdata_to_string(const IR_DATA *data, char *out, size_t out_size);
+IR_PROTOCOL save_signal(rmt_symbol_word_t* raw_data, size_t count);
 
 #endif
