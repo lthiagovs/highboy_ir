@@ -15,6 +15,11 @@ IR_PROTOCOL get_protocol(size_t signal_size){
     case 34:
         return IR_PROTOCOL_NEC;
         break;
+
+        
+    case 21:
+        return IR_PROTOCOL_RC6;
+        break;
     
     default:
         return IR_UNKNOW_PROTOCOL;
