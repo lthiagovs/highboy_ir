@@ -6,6 +6,7 @@
 
 //PROTOCOLS
 #include "ir_protocol_nec.h"
+#include "ir_protocol_rc6.h"
 //PROTOCOLS
 
 IR_PROTOCOL get_protocol(size_t signal_size){
@@ -31,6 +32,7 @@ IR_PROTOCOL get_protocol(size_t signal_size){
 const char* protocol_to_string(IR_PROTOCOL p) {
     switch(p) {
         case IR_PROTOCOL_NEC: return "NEC";
+        case IR_PROTOCOL_RC6: return "RC6";
         default: return "Unknown";
     }
 }
@@ -53,11 +55,27 @@ void irdata_to_string(const IR_DATA *data, char *out, size_t out_size) {
 IR_PROTOCOL save_signal(rmt_symbol_word_t* raw_data, size_t count){
 
     IR_PROTOCOL signal_protocol = get_protocol(count);
+    IR_DATA* data;
+
     switch (signal_protocol) {
     case IR_PROTOCOL_NEC:
 
-        IR_DATA* data = nec_parse_frame(raw_data);
+        data = nec_parse_frame(raw_data);
         if (data) {
+            char out[128];
+            irdata_to_string(data, out, sizeof(out));
+            ESP_LOGW("PROTOCOL", "%s", out);
+            free(data);
+        }else{
+            ESP_LOGW("PROTOCOL", "FALHA");
+        }
+
+        break;
+
+    case IR_PROTOCOL_RC6:
+
+        data = rc6_parse_frame(raw_data);
+        if (data){
             char out[128];
             irdata_to_string(data, out, sizeof(out));
             ESP_LOGW("PROTOCOL", "%s", out);

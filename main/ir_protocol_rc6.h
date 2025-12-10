@@ -19,4 +19,6 @@ bool rc6_validate_start_bit(rmt_symbol_word_t *raw_data);
 bool rc6_parse_logic0(rmt_symbol_word_t *raw_data);
 bool rc6_parse_logic1(rmt_symbol_word_t *raw_data);
 
+IR_DATA* rc6_parse_frame(rmt_symbol_word_t *raw_data);
+
 #endif
